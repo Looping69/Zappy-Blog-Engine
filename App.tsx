@@ -4,11 +4,16 @@ import {
   BlogState, 
   AgentId, 
   AGENTS, 
-  AgentResponse 
+  AgentResponse,
+  SanityConfig,
+  AirtableConfig
 } from './types';
 import { geminiService } from './services/geminiService';
+import { publishToSanity, publishToAirtable } from './services/integrationService';
 import AgentCard from './components/AgentCard';
 import MarkdownRenderer from './components/MarkdownRenderer';
+import PublishModal from './components/PublishModal';
+import SettingsModal from './components/SettingsModal';
 
 const App: React.FC = () => {
   const [state, setState] = useState<BlogState>({
@@ -17,8 +22,24 @@ const App: React.FC = () => {
     history: [],
     finalPost: null,
     isGenerating: false,
-    error: null
+    error: null,
+    totalTokens: 0
   });
+
+  // Settings State with Persistence
+  const [sanityConfig, setSanityConfig] = useState<SanityConfig>(() => {
+    const saved = localStorage.getItem('zappy_sanity_config');
+    return saved ? JSON.parse(saved) : { projectId: '', dataset: 'production', token: '' };
+  });
+
+  const [airtableConfig, setAirtableConfig] = useState<AirtableConfig>(() => {
+    const saved = localStorage.getItem('zappy_airtable_config');
+    return saved ? JSON.parse(saved) : { apiKey: '', baseId: '', tableName: 'Content' };
+  });
+
+  const [publishModal, setPublishModal] = useState<'sanity' | 'airtable' | null>(null);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [notification, setNotification] = useState<{message: string, type: 'success' | 'error'} | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -27,6 +48,23 @@ const App: React.FC = () => {
       scrollRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [state.history, state.activeAgents]);
+
+  // Persist settings
+  useEffect(() => {
+    localStorage.setItem('zappy_sanity_config', JSON.stringify(sanityConfig));
+  }, [sanityConfig]);
+
+  useEffect(() => {
+    localStorage.setItem('zappy_airtable_config', JSON.stringify(airtableConfig));
+  }, [airtableConfig]);
+
+  // Auto-dismiss notification
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
 
   const runOrchestrator = async (keyword: string) => {
     if (!keyword.trim()) return;
@@ -38,46 +76,93 @@ const App: React.FC = () => {
       error: null, 
       history: [], 
       finalPost: null,
-      activeAgents: []
+      activeAgents: [],
+      totalTokens: 0
     }));
 
     let currentContext = "";
     
     try {
+      // 1. Researcher
       setState(prev => ({ ...prev, activeAgents: [AgentId.RESEARCHER] }));
-      const researchResult = await geminiService.runAgentTask(AgentId.RESEARCHER, keyword, "");
-      const researchResponse: AgentResponse = { agentId: AgentId.RESEARCHER, content: researchResult, timestamp: Date.now() };
-      currentContext += `\n\n[RESEARCH REPORT]\n${researchResult}`;
-      setState(prev => ({ ...prev, history: [researchResponse] }));
+      const research = await geminiService.runAgentTask(AgentId.RESEARCHER, keyword, "");
+      const researchResponse: AgentResponse = { 
+        agentId: AgentId.RESEARCHER, 
+        content: research.content, 
+        timestamp: Date.now(),
+        usage: research.usage
+      };
+      currentContext += `\n\n[RESEARCH REPORT]\n${research.content}`;
+      setState(prev => ({ 
+        ...prev, 
+        history: [researchResponse],
+        totalTokens: prev.totalTokens + research.usage.totalTokens
+      }));
 
+      // 2. Writer
       setState(prev => ({ ...prev, activeAgents: [AgentId.WRITER] }));
-      const draftResult = await geminiService.runAgentTask(AgentId.WRITER, keyword, currentContext);
-      const draftResponse: AgentResponse = { agentId: AgentId.WRITER, content: draftResult, timestamp: Date.now() };
-      currentContext += `\n\n[INITIAL DRAFT]\n${draftResult}`;
-      setState(prev => ({ ...prev, history: [researchResponse, draftResponse] }));
+      const draft = await geminiService.runAgentTask(AgentId.WRITER, keyword, currentContext);
+      const draftResponse: AgentResponse = { 
+        agentId: AgentId.WRITER, 
+        content: draft.content, 
+        timestamp: Date.now(),
+        usage: draft.usage
+      };
+      currentContext += `\n\n[INITIAL DRAFT]\n${draft.content}`;
+      setState(prev => ({ 
+        ...prev, 
+        history: [researchResponse, draftResponse],
+        totalTokens: prev.totalTokens + draft.usage.totalTokens
+      }));
 
+      // 3. Parallel Agents (Compliance, Enhancer, SEO)
       setState(prev => ({ ...prev, activeAgents: [AgentId.COMPLIANCE, AgentId.ENHANCER, AgentId.SEO] }));
       const parallelTask = async (id: AgentId) => {
         const result = await geminiService.runAgentTask(id, keyword, currentContext);
-        return { agentId: id, content: result, timestamp: Date.now() };
+        return { 
+          agentId: id, 
+          content: result.content, 
+          timestamp: Date.now(),
+          usage: result.usage
+        };
       };
+      
       const parallelResults = await Promise.all([
         parallelTask(AgentId.COMPLIANCE),
         parallelTask(AgentId.ENHANCER),
         parallelTask(AgentId.SEO)
       ]);
 
+      const parallelTokens = parallelResults.reduce((acc, curr) => acc + (curr.usage?.totalTokens || 0), 0);
       const updatedHistory = [researchResponse, draftResponse, ...parallelResults];
-      setState(prev => ({ ...prev, history: updatedHistory }));
+      
+      setState(prev => ({ 
+        ...prev, 
+        history: updatedHistory,
+        totalTokens: prev.totalTokens + parallelTokens
+      }));
+      
       parallelResults.forEach(res => {
         const agentName = AGENTS.find(a => a.id === res.agentId)?.name || res.agentId;
         currentContext += `\n\n[FEEDBACK FROM ${agentName.toUpperCase()}]\n${res.content}`;
       });
 
+      // 4. Editor
       setState(prev => ({ ...prev, activeAgents: [AgentId.EDITOR] }));
-      const finalResult = await geminiService.runAgentTask(AgentId.EDITOR, keyword, currentContext);
-      const finalResponse: AgentResponse = { agentId: AgentId.EDITOR, content: finalResult, timestamp: Date.now() };
-      setState(prev => ({ ...prev, history: [...updatedHistory, finalResponse], finalPost: finalResult }));
+      const final = await geminiService.runAgentTask(AgentId.EDITOR, keyword, currentContext);
+      const finalResponse: AgentResponse = { 
+        agentId: AgentId.EDITOR, 
+        content: final.content, 
+        timestamp: Date.now(),
+        usage: final.usage
+      };
+      
+      setState(prev => ({ 
+        ...prev, 
+        history: [...updatedHistory, finalResponse], 
+        finalPost: final.content,
+        totalTokens: prev.totalTokens + final.usage.totalTokens
+      }));
 
     } catch (err: any) {
       setState(prev => ({ ...prev, error: err.message || "System failure." }));
@@ -94,11 +179,38 @@ const App: React.FC = () => {
   };
 
   const reset = () => {
-    setState({ keyword: '', activeAgents: [], history: [], finalPost: null, isGenerating: false, error: null });
+    setState({ keyword: '', activeAgents: [], history: [], finalPost: null, isGenerating: false, error: null, totalTokens: 0 });
+  };
+
+  const extractTitle = (content: string) => {
+    const match = content.match(/^# (.*$)/m);
+    return match ? match[1] : 'Zappy Medical Post';
+  };
+
+  const handlePublish = async (config: any) => {
+    if (!state.finalPost) return;
+    const title = extractTitle(state.finalPost);
+    
+    if (publishModal === 'sanity') {
+      await publishToSanity(config, title, state.finalPost);
+      setNotification({ message: 'Successfully published to Sanity CMS!', type: 'success' });
+    } else if (publishModal === 'airtable') {
+      await publishToAirtable(config, title, state.finalPost);
+      setNotification({ message: 'Successfully sent to Airtable Base!', type: 'success' });
+    }
   };
 
   return (
-    <div className="flex h-screen w-full bg-[#FDFCFB] overflow-hidden">
+    <div className="flex h-screen w-full bg-[#FDFCFB] overflow-hidden relative">
+      {/* Notifications */}
+      {notification && (
+        <div className={`fixed top-8 left-1/2 -translate-x-1/2 z-[100] px-6 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-[slideInTop_0.3s_ease-out]
+          ${notification.type === 'success' ? 'bg-emerald-500 text-white' : 'bg-red-500 text-white'}`}>
+           <span className="text-xl">{notification.type === 'success' ? '✅' : '⚠️'}</span>
+           <span className="font-bold text-sm">{notification.message}</span>
+        </div>
+      )}
+
       {/* Sidebar Dashboard */}
       <aside className="w-80 flex-shrink-0 border-r border-slate-100 bg-white flex flex-col h-full shadow-[4px_0_24px_rgba(0,0,0,0.02)]">
         <div className="p-8 pb-4 flex items-center gap-3 cursor-pointer group" onClick={reset}>
@@ -132,20 +244,34 @@ const App: React.FC = () => {
           {(state.isGenerating || state.finalPost) && (
             <div className="px-4 py-6 rounded-3xl bg-orange-50/50 border border-orange-100">
                <h3 className="text-[10px] font-black text-orange-600 uppercase tracking-[0.2em] mb-3">Generation Stats</h3>
-               <div className="space-y-3">
-                 <div className="flex justify-between text-xs">
-                   <span className="text-slate-500">Progress</span>
-                   <span className="font-bold text-orange-600">{Math.round((state.history.length / AGENTS.length) * 100)}%</span>
+               <div className="space-y-4">
+                 <div className="space-y-2">
+                   <div className="flex justify-between text-xs">
+                     <span className="text-slate-500">Progress</span>
+                     <span className="font-bold text-orange-600">{Math.round((state.history.length / AGENTS.length) * 100)}%</span>
+                   </div>
+                   <div className="h-1.5 w-full bg-orange-100 rounded-full overflow-hidden">
+                     <div className="h-full bg-orange-500 transition-all duration-500" style={{ width: `${(state.history.length / AGENTS.length) * 100}%` }}></div>
+                   </div>
                  </div>
-                 <div className="h-1.5 w-full bg-orange-100 rounded-full overflow-hidden">
-                   <div className="h-full bg-orange-500 transition-all duration-500" style={{ width: `${(state.history.length / AGENTS.length) * 100}%` }}></div>
+                 
+                 <div className="flex items-center gap-3 p-3 bg-white rounded-xl border border-orange-100/50 shadow-sm">
+                   <div className="w-8 h-8 rounded-lg bg-orange-100 flex items-center justify-center text-xs text-orange-600 font-black">
+                     TOK
+                   </div>
+                   <div>
+                     <p className="text-[9px] font-black text-slate-400 uppercase tracking-wider">Total Tokens</p>
+                     <p className="text-sm font-bold text-slate-900 font-mono">
+                       {state.totalTokens.toLocaleString()}
+                     </p>
+                   </div>
                  </div>
                </div>
             </div>
           )}
         </nav>
 
-        <div className="p-6 border-t border-slate-50">
+        <div className="p-6 border-t border-slate-50 flex flex-col gap-4">
           <div className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-slate-50 border border-slate-100">
              <div className="w-8 h-8 rounded-full bg-orange-100 flex items-center justify-center text-xs">⚡</div>
              <div className="flex-1">
@@ -153,6 +279,19 @@ const App: React.FC = () => {
                <p className="text-[9px] text-slate-400 font-medium">Parallel Consensus v2.4</p>
              </div>
           </div>
+          
+          <button 
+            onClick={() => setIsSettingsOpen(true)}
+            className="w-full flex items-center gap-3 px-4 py-3 rounded-2xl bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 transition-all group"
+          >
+            <div className="w-8 h-8 rounded-full bg-slate-100 flex items-center justify-center text-slate-500 group-hover:text-slate-900 transition-colors">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+            </div>
+            <div className="flex-1 text-left">
+              <p className="text-[10px] font-bold text-slate-900">Settings</p>
+              <p className="text-[9px] text-slate-400 font-medium">Integrations & Config</p>
+            </div>
+          </button>
         </div>
       </aside>
 
@@ -238,8 +377,16 @@ const App: React.FC = () => {
                               <span className="text-[9px] text-slate-400 font-bold uppercase tracking-[0.2em]">{agent?.role}</span>
                             </div>
                           </div>
-                          <div className="h-6 w-px bg-slate-200"></div>
-                          <span className="text-[10px] font-mono text-slate-400 uppercase">Neural_Log v{idx+1}.0</span>
+                          <div className="flex items-center gap-4">
+                            {item.usage && (
+                              <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Tokens</span>
+                                <span className="text-[10px] font-bold text-slate-600 font-mono">{item.usage.totalTokens.toLocaleString()}</span>
+                              </div>
+                            )}
+                            <div className="h-6 w-px bg-slate-200"></div>
+                            <span className="text-[10px] font-mono text-slate-400 uppercase">Neural_Log v{idx+1}.0</span>
+                          </div>
                         </div>
                         <div className="p-8">
                           <div className="text-slate-600 whitespace-pre-wrap text-sm max-h-[300px] overflow-y-auto font-mono bg-slate-50 p-6 rounded-2xl border border-slate-100 custom-scrollbar leading-relaxed">
@@ -253,10 +400,24 @@ const App: React.FC = () => {
                 </div>
               ) : state.finalPost && (
                 <div className="bg-white p-12 md:p-20 rounded-[52px] shadow-[0_32px_80px_rgba(0,0,0,0.06)] border border-slate-100 animate-[fadeIn_0.8s_ease-out] relative">
-                  <div className="mb-12">
-                     <div className="inline-flex items-center gap-3 px-6 py-2 bg-orange-50 text-orange-700 rounded-full text-[10px] font-black uppercase tracking-[0.3em] mb-10 border border-orange-100">
+                  <div className="mb-12 flex items-center justify-between">
+                     <div className="inline-flex items-center gap-3 px-6 py-2 bg-orange-50 text-orange-700 rounded-full text-[10px] font-black uppercase tracking-[0.3em] border border-orange-100">
                        <span className="w-2.5 h-2.5 bg-orange-500 rounded-full animate-pulse shadow-sm"></span>
                        Clinical Grade Publication
+                     </div>
+                     <div className="flex gap-3">
+                        <button 
+                          onClick={() => setPublishModal('sanity')}
+                          className="flex items-center gap-2 px-4 py-2 bg-[#F03E2F]/10 text-[#F03E2F] rounded-xl hover:bg-[#F03E2F] hover:text-white transition-colors text-xs font-bold"
+                        >
+                          Publish to Sanity
+                        </button>
+                        <button 
+                          onClick={() => setPublishModal('airtable')}
+                          className="flex items-center gap-2 px-4 py-2 bg-[#FCB400]/10 text-[#e6a200] rounded-xl hover:bg-[#FCB400] hover:text-white transition-colors text-xs font-bold"
+                        >
+                          Publish to Airtable
+                        </button>
                      </div>
                   </div>
 
@@ -267,7 +428,7 @@ const App: React.FC = () => {
                         <div className="w-14 h-14 bg-orange-50 rounded-2xl flex items-center justify-center text-2xl">🎖️</div>
                         <div>
                           <p className="text-base font-black text-slate-900 leading-tight">Zappy Authority Suite</p>
-                          <p className="text-xs text-slate-400 font-medium">Verified by 6 Medical Agents • {new Date().toLocaleDateString()}</p>
+                          <p className="text-xs text-slate-400 font-medium">Verified by 6 Medical Agents • {state.totalTokens > 0 && `${state.totalTokens.toLocaleString()} tokens`}</p>
                         </div>
                      </div>
                      <button 
@@ -284,6 +445,28 @@ const App: React.FC = () => {
         </div>
       </main>
 
+      <PublishModal 
+        isOpen={!!publishModal} 
+        type={publishModal} 
+        onClose={() => setPublishModal(null)} 
+        onPublish={handlePublish}
+        initialSanityConfig={sanityConfig}
+        initialAirtableConfig={airtableConfig}
+      />
+
+      <SettingsModal 
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        savedSanityConfig={sanityConfig}
+        savedAirtableConfig={airtableConfig}
+        onSave={(newSanity, newAirtable) => {
+          setSanityConfig(newSanity);
+          setAirtableConfig(newAirtable);
+          setNotification({ message: 'Settings saved successfully', type: 'success' });
+          setIsSettingsOpen(false);
+        }}
+      />
+
       <style>{`
         @keyframes shimmer {
           0% { transform: translateX(-100%); }
@@ -291,6 +474,7 @@ const App: React.FC = () => {
         }
         @keyframes slideIn { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes slideInTop { from { opacity: 0; transform: translate(-50%, -20px); } to { opacity: 1; transform: translate(-50%, 0); } }
       `}</style>
     </div>
   );

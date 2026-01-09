@@ -1,5 +1,6 @@
+
 import { GoogleGenAI } from "@google/genai";
-import { AgentId } from "../types";
+import { AgentId, TokenUsage } from "../types";
 
 export class GeminiService {
   private getPromptForAgent(agentId: AgentId, keyword: string, context: string): string {
@@ -111,11 +112,9 @@ export class GeminiService {
     }
   }
 
-  async runAgentTask(agentId: AgentId, keyword: string, previousContext: string): Promise<string> {
+  async runAgentTask(agentId: AgentId, keyword: string, previousContext: string): Promise<{content: string, usage: TokenUsage}> {
     try {
       const prompt = this.getPromptForAgent(agentId, keyword, previousContext);
-      // Initialize GoogleGenAI directly with process.env.API_KEY as per guidelines
-      // Creating a new instance right before the call ensures the latest API key is used.
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
       const response = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
@@ -127,8 +126,16 @@ export class GeminiService {
         }
       });
 
-      // Directly access .text property as per GenerateContentResponse guidelines
-      return response.text || "Agent failed to generate response.";
+      const usage: TokenUsage = {
+        promptTokens: response.usageMetadata?.promptTokenCount || 0,
+        responseTokens: response.usageMetadata?.candidatesTokenCount || 0,
+        totalTokens: response.usageMetadata?.totalTokenCount || 0
+      };
+
+      return {
+        content: response.text || "Agent failed to generate response.",
+        usage
+      };
     } catch (error) {
       console.error(`Error in agent ${agentId}:`, error);
       throw new Error(`Agent ${agentId} encountered a failure: ${error instanceof Error ? error.message : 'Unknown error'}`);

@@ -16,10 +16,17 @@ export interface Agent {
   icon: string;
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  responseTokens: number;
+  totalTokens: number;
+}
+
 export interface AgentResponse {
   agentId: AgentId;
   content: string;
   timestamp: number;
+  usage?: TokenUsage;
 }
 
 export interface BlogState {
@@ -29,6 +36,19 @@ export interface BlogState {
   finalPost: string | null;
   isGenerating: boolean;
   error: string | null;
+  totalTokens: number;
+}
+
+export interface SanityConfig {
+  projectId: string;
+  dataset: string;
+  token: string;
+}
+
+export interface AirtableConfig {
+  apiKey: string;
+  baseId: string;
+  tableName: string;
 }
 
 export const AGENTS: Agent[] = [
